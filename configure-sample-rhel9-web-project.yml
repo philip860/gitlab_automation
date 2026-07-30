@@ -1,0 +1,920 @@
+---
+###############################################################################
+# Create and seed the image-mode/sample-rhel9-web GitLab project
+#
+# Authentication model:
+#
+# - The playbook runs locally on the GitLab host as root.
+# - Project creation is performed through gitlab-rails runner.
+# - No administrator password or externally supplied API token is required.
+# - A short-lived project access token is created for the initial Git push.
+# - The token is revoked before the playbook finishes.
+#
+# Expected inventory group:
+#
+#   gitlab
+#
+# Expected source directory:
+#
+#   /var/lib/image-mode/projects/sample-rhel9-web
+#
+# The source directory can be overridden with:
+#
+#   -e gitlab_project_source_directory=/path/to/source
+###############################################################################
+
+- name: Create and seed sample-rhel9-web GitLab project
+  hosts: gitlab
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+  serial: 1
+
+  environment:
+    LANG: C.UTF-8
+    LC_ALL: C.UTF-8
+
+  vars:
+    ###########################################################################
+    # Project identity
+    ###########################################################################
+
+    gitlab_project_group_path: "image-mode"
+    gitlab_project_name: "sample-rhel9-web"
+    gitlab_project_path: "sample-rhel9-web"
+
+    gitlab_project_full_path: >-
+      {{ gitlab_project_group_path }}/{{ gitlab_project_path }}
+
+    gitlab_project_description: >-
+      Sample RHEL 9 Image Mode web application and bootc image source.
+
+    gitlab_project_visibility: "internal"
+    gitlab_project_default_branch: "main"
+
+    ###########################################################################
+    # Source content
+    ###########################################################################
+
+    gitlab_project_source_directory: >-
+      /var/lib/image-mode/projects/sample-rhel9-web
+
+    gitlab_project_commit_author_name: "Image Mode Automation"
+    gitlab_project_commit_author_email: "image-mode-automation@localhost"
+
+    gitlab_project_commit_message: >-
+      Initialize sample-rhel9-web project content
+
+    gitlab_project_sync_delete: true
+
+    gitlab_project_sync_excludes:
+      - ".git"
+      - ".terraform"
+      - "*.tfstate"
+      - "*.tfstate.*"
+      - "*.retry"
+      - "*.log"
+      - ".DS_Store"
+
+    ###########################################################################
+    # GitLab connection
+    ###########################################################################
+
+    gitlab_project_fqdn: >-
+      {{
+        gitlab_hostname
+        | default(public_tls_fqdn, true)
+        | default(inventory_hostname, true)
+      }}
+
+    gitlab_project_external_url: >-
+      https://{{ gitlab_project_fqdn }}
+
+    gitlab_project_repository_url: >-
+      {{ gitlab_project_external_url }}/{{ gitlab_project_full_path }}.git
+
+    ###########################################################################
+    # Temporary token
+    ###########################################################################
+
+    gitlab_project_token_name: >-
+      ansible-bootstrap-{{ gitlab_project_path }}
+
+    # Long enough to survive the current playbook execution. The token is
+    # explicitly revoked in the always section.
+    gitlab_project_token_expiration_days: 1
+
+    gitlab_project_token_scopes:
+      - api
+      - write_repository
+
+    ###########################################################################
+    # Temporary workspace
+    ###########################################################################
+
+    gitlab_project_workspace_root: "/var/tmp"
+    gitlab_project_workspace_prefix: "gitlab-project-bootstrap-"
+
+  pre_tasks:
+    ###########################################################################
+    # PHASE 0 | Validate deployment inputs
+    ###########################################################################
+
+    - name: PHASE 0 | Verify supported operating system
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.os_family == "RedHat"
+          - ansible_facts.distribution_major_version | int >= 8
+        fail_msg: >-
+          GitLab project provisioning requires a Red Hat-family operating
+          system version 8 or later.
+
+    - name: PHASE 0 | Validate project configuration
+      ansible.builtin.assert:
+        that:
+          - gitlab_project_group_path | length > 0
+          - gitlab_project_group_path is match('^[a-z0-9][a-z0-9._-]*$')
+          - gitlab_project_name | length > 0
+          - gitlab_project_path | length > 0
+          - gitlab_project_path is match('^[a-z0-9][a-z0-9._-]*$')
+          - gitlab_project_full_path == "image-mode/sample-rhel9-web"
+          - gitlab_project_default_branch | length > 0
+          - gitlab_project_source_directory | length > 0
+          - gitlab_project_fqdn | length > 0
+        fail_msg: >-
+          The project configuration is invalid. This playbook expects the
+          project image-mode/sample-rhel9-web and a valid source directory.
+
+    - name: PHASE 0 | Inspect project source directory
+      ansible.builtin.stat:
+        path: "{{ gitlab_project_source_directory }}"
+      register: gitlab_project_source_directory_status
+
+    - name: PHASE 0 | Require project source directory
+      ansible.builtin.assert:
+        that:
+          - gitlab_project_source_directory_status.stat.exists
+          - gitlab_project_source_directory_status.stat.isdir
+        fail_msg: >-
+          The project source directory
+          {{ gitlab_project_source_directory }} does not exist or is not a
+          directory on {{ inventory_hostname }}.
+
+    - name: PHASE 0 | Verify required commands
+      ansible.builtin.command:
+        argv:
+          - /bin/bash
+          - -c
+          - "command -v {{ item }}"
+      loop:
+        - git
+        - gitlab-rails
+        - rsync
+      changed_when: false
+
+    - name: PHASE 0 | Check GitLab service status
+      ansible.builtin.command:
+        argv:
+          - gitlab-ctl
+          - status
+      changed_when: false
+
+  tasks:
+    ###########################################################################
+    # PHASE 1 | Create or reconcile the GitLab project
+    ###########################################################################
+
+    - name: PHASE 1 | Create or reconcile GitLab project
+      ansible.builtin.command:
+        argv:
+          - gitlab-rails
+          - runner
+          - "-"
+      args:
+        stdin: |
+          require "json"
+
+          group_path =
+            ENV.fetch("GITLAB_PROJECT_GROUP_PATH")
+               .to_s
+               .strip
+
+          project_name =
+            ENV.fetch("GITLAB_PROJECT_NAME")
+               .to_s
+               .strip
+
+          project_path =
+            ENV.fetch("GITLAB_PROJECT_PATH")
+               .to_s
+               .strip
+
+          description =
+            ENV.fetch(
+              "GITLAB_PROJECT_DESCRIPTION",
+              ""
+            ).to_s
+
+          requested_visibility =
+            ENV.fetch(
+              "GITLAB_PROJECT_VISIBILITY",
+              "internal"
+            ).to_s
+
+          result = {
+            project_created: false,
+            project_updated: false,
+            project_existing: false,
+            project_id: nil,
+            project_full_path: nil,
+            web_url: nil,
+            errors: []
+          }
+
+          begin
+            actor =
+              User.find_by(username: "root") ||
+              User.where(admin: true).first
+
+            raise(
+              "No local GitLab administrator account exists"
+            ) unless actor
+
+            namespace =
+              Group.find_by_full_path(group_path)
+
+            raise(
+              "GitLab group #{group_path} does not exist"
+            ) unless namespace
+
+            full_path =
+              "#{group_path}/#{project_path}"
+
+            project =
+              Project.find_by_full_path(full_path)
+
+            visibility_level =
+              case requested_visibility
+              when "private"
+                Gitlab::VisibilityLevel::PRIVATE
+              when "public"
+                Gitlab::VisibilityLevel::PUBLIC
+              else
+                Gitlab::VisibilityLevel::INTERNAL
+              end
+
+            if project.nil?
+              parameters = {
+                name: project_name,
+                path: project_path,
+                namespace_id: namespace.id,
+                description: description,
+                visibility_level: visibility_level,
+                initialize_with_readme: false
+              }
+
+              response =
+                Projects::CreateService
+                  .new(actor, parameters)
+                  .execute
+
+              if response.respond_to?(:success?)
+                unless response.success?
+                  message =
+                    if response.respond_to?(:message)
+                      response.message
+                    else
+                      response.to_s
+                    end
+
+                  raise(
+                    "Projects::CreateService failed: #{message}"
+                  )
+                end
+
+                payload =
+                  response.respond_to?(:payload) ?
+                    response.payload :
+                    nil
+
+                project =
+                  if payload.is_a?(Hash)
+                    payload[:project] ||
+                      payload["project"]
+                  elsif payload.is_a?(Project)
+                    payload
+                  end
+              elsif response.is_a?(Project)
+                project = response
+              end
+
+              raise(
+                "Project creation returned no project"
+              ) unless project
+
+              result[:project_created] = true
+            else
+              changed = false
+
+              if project.name != project_name
+                project.name = project_name
+                changed = true
+              end
+
+              if project.description.to_s != description
+                project.description = description
+                changed = true
+              end
+
+              if project.visibility_level != visibility_level
+                project.visibility_level = visibility_level
+                changed = true
+              end
+
+              if changed
+                project.save!
+                result[:project_updated] = true
+              else
+                result[:project_existing] = true
+              end
+            end
+
+            result[:project_id] =
+              project.id
+
+            result[:project_full_path] =
+              project.full_path
+
+            result[:web_url] =
+              project.web_url
+          rescue StandardError => error
+            result[:errors] << {
+              error:
+                "#{error.class}: #{error.message}"
+            }
+          end
+
+          puts(
+            "GITLAB_PROJECT_RESULT=" +
+            JSON.generate(result)
+          )
+
+          exit 1 unless result[:errors].empty?
+      environment:
+        GITLAB_PROJECT_GROUP_PATH: "{{ gitlab_project_group_path }}"
+        GITLAB_PROJECT_NAME: "{{ gitlab_project_name }}"
+        GITLAB_PROJECT_PATH: "{{ gitlab_project_path }}"
+        GITLAB_PROJECT_DESCRIPTION: "{{ gitlab_project_description }}"
+        GITLAB_PROJECT_VISIBILITY: "{{ gitlab_project_visibility }}"
+      register: gitlab_project_creation_command
+      changed_when: >-
+        (
+          '"project_created":true'
+          in gitlab_project_creation_command.stdout
+        )
+        or
+        (
+          '"project_updated":true'
+          in gitlab_project_creation_command.stdout
+        )
+
+    - name: PHASE 1 | Extract project creation result
+      ansible.builtin.set_fact:
+        gitlab_project_result: >-
+          {{
+            (
+              gitlab_project_creation_command.stdout_lines
+              | select('match', '^GITLAB_PROJECT_RESULT=')
+              | map(
+                  'regex_replace',
+                  '^GITLAB_PROJECT_RESULT=',
+                  ''
+                )
+              | first
+            )
+            | from_json
+          }}
+
+    - name: PHASE 1 | Validate project creation result
+      ansible.builtin.assert:
+        that:
+          - gitlab_project_result.errors is defined
+          - gitlab_project_result.errors | length == 0
+          - gitlab_project_result.project_id is defined
+          - gitlab_project_result.project_id | int > 0
+          - >-
+            gitlab_project_result.project_full_path
+            ==
+            gitlab_project_full_path
+        fail_msg: >-
+          GitLab did not successfully create or locate project
+          {{ gitlab_project_full_path }}.
+
+    ###########################################################################
+    # PHASE 2 | Create temporary project token
+    ###########################################################################
+
+    - name: PHASE 2 | Create temporary project access token
+      ansible.builtin.command:
+        argv:
+          - gitlab-rails
+          - runner
+          - "-"
+      args:
+        stdin: |
+          require "json"
+          require "date"
+
+          project_id =
+            Integer(
+              ENV.fetch("GITLAB_PROJECT_ID")
+            )
+
+          token_name =
+            ENV.fetch("GITLAB_PROJECT_TOKEN_NAME")
+               .to_s
+               .strip
+
+          expiration_days =
+            Integer(
+              ENV.fetch(
+                "GITLAB_PROJECT_TOKEN_EXPIRATION_DAYS",
+                "1"
+              )
+            )
+
+          result = {
+            token_id: nil,
+            token: nil,
+            username: nil,
+            errors: []
+          }
+
+          begin
+            project =
+              Project.find(project_id)
+
+            existing_token =
+              PersonalAccessToken
+                .active
+                .find_by(
+                  name: token_name,
+                  project_id: project.id
+                )
+
+            existing_token&.revoke!
+
+            token =
+              PersonalAccessToken.new(
+                name: token_name,
+                scopes: [
+                  "api",
+                  "write_repository"
+                ],
+                expires_at:
+                  Date.current + expiration_days.days,
+                project: project
+              )
+
+            token.set_token
+            token.save!
+
+            result[:token_id] =
+              token.id
+
+            result[:token] =
+              token.token
+
+            result[:username] =
+              "oauth2"
+          rescue StandardError => error
+            result[:errors] << {
+              error:
+                "#{error.class}: #{error.message}"
+            }
+          end
+
+          puts(
+            "GITLAB_PROJECT_TOKEN_RESULT=" +
+            JSON.generate(result)
+          )
+
+          exit 1 unless result[:errors].empty?
+      environment:
+        GITLAB_PROJECT_ID: >-
+          {{ gitlab_project_result.project_id | string }}
+        GITLAB_PROJECT_TOKEN_NAME: "{{ gitlab_project_token_name }}"
+        GITLAB_PROJECT_TOKEN_EXPIRATION_DAYS: >-
+          {{ gitlab_project_token_expiration_days | string }}
+      register: gitlab_project_token_creation_command
+      changed_when: true
+      no_log: true
+
+    - name: PHASE 2 | Extract temporary project token result
+      ansible.builtin.set_fact:
+        gitlab_project_token_result: >-
+          {{
+            (
+              gitlab_project_token_creation_command.stdout_lines
+              | select(
+                  'match',
+                  '^GITLAB_PROJECT_TOKEN_RESULT='
+                )
+              | map(
+                  'regex_replace',
+                  '^GITLAB_PROJECT_TOKEN_RESULT=',
+                  ''
+                )
+              | first
+            )
+            | from_json
+          }}
+      no_log: true
+
+    - name: PHASE 2 | Validate temporary project token
+      ansible.builtin.assert:
+        that:
+          - gitlab_project_token_result.errors | length == 0
+          - gitlab_project_token_result.token_id | int > 0
+          - gitlab_project_token_result.token | length > 0
+          - gitlab_project_token_result.username | length > 0
+        fail_msg: >-
+          GitLab did not generate the temporary project access token.
+      no_log: true
+
+    ###########################################################################
+    # PHASE 3 | Create temporary workspace
+    ###########################################################################
+
+    - name: PHASE 3 | Create temporary project workspace
+      ansible.builtin.tempfile:
+        state: directory
+        path: "{{ gitlab_project_workspace_root }}"
+        prefix: "{{ gitlab_project_workspace_prefix }}"
+      register: gitlab_project_workspace
+
+    - name: PHASE 3 | Set temporary workspace paths
+      ansible.builtin.set_fact:
+        gitlab_project_checkout_directory: >-
+          {{ gitlab_project_workspace.path }}/repository
+        gitlab_project_askpass_path: >-
+          {{ gitlab_project_workspace.path }}/git-askpass.sh
+
+    - name: PHASE 3 | Create temporary Git askpass helper
+      ansible.builtin.copy:
+        dest: "{{ gitlab_project_askpass_path }}"
+        owner: root
+        group: root
+        mode: "0700"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          case "${1:-}" in
+            *Username*|*username*)
+              printf '%s\n' "${GITLAB_AUTOMATION_USERNAME}"
+              ;;
+            *Password*|*password*)
+              printf '%s\n' "${GITLAB_AUTOMATION_TOKEN}"
+              ;;
+            *)
+              exit 1
+              ;;
+          esac
+      no_log: true
+
+    ###########################################################################
+    # PHASE 4 | Synchronize and push repository content
+    ###########################################################################
+
+    - name: PHASE 4 | Synchronize project repository
+      block:
+        - name: PHASE 4 | Clone GitLab project
+          ansible.builtin.command:
+            argv:
+              - git
+              - clone
+              - "{{ gitlab_project_repository_url }}"
+              - "{{ gitlab_project_checkout_directory }}"
+          environment:
+            GIT_ASKPASS: "{{ gitlab_project_askpass_path }}"
+            GIT_TERMINAL_PROMPT: "0"
+            GITLAB_AUTOMATION_USERNAME: >-
+              {{ gitlab_project_token_result.username }}
+            GITLAB_AUTOMATION_TOKEN: >-
+              {{ gitlab_project_token_result.token }}
+          register: gitlab_project_clone
+          changed_when: true
+          no_log: true
+
+        - name: PHASE 4 | Configure Git commit identity
+          ansible.builtin.command:
+            argv:
+              - git
+              - -C
+              - "{{ gitlab_project_checkout_directory }}"
+              - config
+              - "{{ item.name }}"
+              - "{{ item.value }}"
+          loop:
+            - name: user.name
+              value: "{{ gitlab_project_commit_author_name }}"
+            - name: user.email
+              value: "{{ gitlab_project_commit_author_email }}"
+          changed_when: false
+
+        - name: PHASE 4 | Build rsync exclusion arguments
+          ansible.builtin.set_fact:
+            gitlab_project_rsync_exclude_arguments: >-
+              {{
+                gitlab_project_sync_excludes
+                | map(
+                    'regex_replace',
+                    '^(.*)$',
+                    '--exclude=\1'
+                  )
+                | list
+              }}
+
+        - name: PHASE 4 | Synchronize source files into checkout
+          ansible.builtin.command:
+            argv: >-
+              {{
+                [
+                  'rsync',
+                  '--archive'
+                ]
+                +
+                (
+                  ['--delete']
+                  if gitlab_project_sync_delete | bool
+                  else []
+                )
+                +
+                gitlab_project_rsync_exclude_arguments
+                +
+                [
+                  (
+                    gitlab_project_source_directory
+                    | regex_replace('/+$', '')
+                  ) ~ '/',
+                  gitlab_project_checkout_directory ~ '/'
+                ]
+              }}
+          changed_when: false
+
+        - name: PHASE 4 | Stage repository content
+          ansible.builtin.command:
+            argv:
+              - git
+              - -C
+              - "{{ gitlab_project_checkout_directory }}"
+              - add
+              - --all
+          changed_when: false
+
+        - name: PHASE 4 | Check for staged repository changes
+          ansible.builtin.command:
+            argv:
+              - git
+              - -C
+              - "{{ gitlab_project_checkout_directory }}"
+              - diff
+              - --cached
+              - --quiet
+              - --exit-code
+          register: gitlab_project_staged_changes
+          changed_when: false
+          failed_when:
+            - gitlab_project_staged_changes.rc not in [0, 1]
+
+        - name: PHASE 4 | Create repository commit
+          ansible.builtin.command:
+            argv:
+              - git
+              - -C
+              - "{{ gitlab_project_checkout_directory }}"
+              - commit
+              - --message
+              - "{{ gitlab_project_commit_message }}"
+          when: gitlab_project_staged_changes.rc == 1
+          changed_when: true
+
+        - name: PHASE 4 | Push initial project content
+          ansible.builtin.command:
+            argv:
+              - git
+              - -C
+              - "{{ gitlab_project_checkout_directory }}"
+              - push
+              - --set-upstream
+              - origin
+              - "HEAD:{{ gitlab_project_default_branch }}"
+          environment:
+            GIT_ASKPASS: "{{ gitlab_project_askpass_path }}"
+            GIT_TERMINAL_PROMPT: "0"
+            GITLAB_AUTOMATION_USERNAME: >-
+              {{ gitlab_project_token_result.username }}
+            GITLAB_AUTOMATION_TOKEN: >-
+              {{ gitlab_project_token_result.token }}
+          when: gitlab_project_staged_changes.rc == 1
+          changed_when: true
+          no_log: true
+
+    ###########################################################################
+    # PHASE 5 | Configure and verify default branch
+    ###########################################################################
+
+    - name: PHASE 5 | Configure and verify project default branch
+      ansible.builtin.command:
+        argv:
+          - gitlab-rails
+          - runner
+          - "-"
+      args:
+        stdin: |
+          require "json"
+
+          full_path =
+            ENV.fetch("GITLAB_PROJECT_FULL_PATH")
+
+          default_branch =
+            ENV.fetch("GITLAB_PROJECT_DEFAULT_BRANCH")
+
+          result = {
+            project_full_path: full_path,
+            default_branch: nil,
+            repository_exists: false,
+            errors: []
+          }
+
+          begin
+            project =
+              Project.find_by_full_path(full_path)
+
+            raise(
+              "Project #{full_path} does not exist"
+            ) unless project
+
+            unless project.repository.exists?
+              raise(
+                "Project repository has not been initialized"
+              )
+            end
+
+            branch =
+              project.repository.find_branch(
+                default_branch
+              )
+
+            raise(
+              "Branch #{default_branch} does not exist"
+            ) unless branch
+
+            if project.default_branch != default_branch
+              project.update!(
+                default_branch: default_branch
+              )
+            end
+
+            result[:default_branch] =
+              project.default_branch
+
+            result[:repository_exists] =
+              project.repository.exists?
+          rescue StandardError => error
+            result[:errors] << {
+              error:
+                "#{error.class}: #{error.message}"
+            }
+          end
+
+          puts(
+            "GITLAB_PROJECT_VERIFICATION=" +
+            JSON.generate(result)
+          )
+
+          exit 1 unless result[:errors].empty?
+      environment:
+        GITLAB_PROJECT_FULL_PATH: "{{ gitlab_project_full_path }}"
+        GITLAB_PROJECT_DEFAULT_BRANCH: >-
+          {{ gitlab_project_default_branch }}
+      register: gitlab_project_verification_command
+      changed_when: false
+
+    - name: PHASE 5 | Extract project verification
+      ansible.builtin.set_fact:
+        gitlab_project_verification: >-
+          {{
+            (
+              gitlab_project_verification_command.stdout_lines
+              | select(
+                  'match',
+                  '^GITLAB_PROJECT_VERIFICATION='
+                )
+              | map(
+                  'regex_replace',
+                  '^GITLAB_PROJECT_VERIFICATION=',
+                  ''
+                )
+              | first
+            )
+            | from_json
+          }}
+
+    - name: PHASE 5 | Assert project is initialized
+      ansible.builtin.assert:
+        that:
+          - gitlab_project_verification.errors | length == 0
+          - gitlab_project_verification.repository_exists | bool
+          - >-
+            gitlab_project_verification.default_branch
+            ==
+            gitlab_project_default_branch
+        fail_msg: >-
+          Project {{ gitlab_project_full_path }} exists, but its repository or
+          default branch was not initialized correctly.
+
+  always:
+    ###########################################################################
+    # Always revoke credentials and remove temporary content
+    ###########################################################################
+
+    - name: CLEANUP | Revoke temporary project access token
+      ansible.builtin.command:
+        argv:
+          - gitlab-rails
+          - runner
+          - "-"
+      args:
+        stdin: |
+          token_id =
+            ENV.fetch(
+              "GITLAB_PROJECT_TOKEN_ID",
+              ""
+            ).to_s.strip
+
+          unless token_id.empty?
+            token =
+              PersonalAccessToken.find_by(
+                id: token_id.to_i
+              )
+
+            token.revoke! if token && !token.revoked?
+          end
+      environment:
+        GITLAB_PROJECT_TOKEN_ID: >-
+          {{
+            gitlab_project_token_result.token_id
+            | default('')
+            | string
+          }}
+      when:
+        - gitlab_project_token_result is defined
+        - gitlab_project_token_result.token_id is defined
+      changed_when: true
+      no_log: true
+
+    - name: CLEANUP | Remove temporary project workspace
+      ansible.builtin.file:
+        path: "{{ gitlab_project_workspace.path }}"
+        state: absent
+      when:
+        - gitlab_project_workspace is defined
+        - gitlab_project_workspace.path is defined
+      no_log: true
+
+  post_tasks:
+    ###########################################################################
+    # PHASE 6 | Report
+    ###########################################################################
+
+    - name: PHASE 6 | Display project provisioning result
+      ansible.builtin.debug:
+        msg:
+          - >-
+            GitLab project:
+            {{ gitlab_project_external_url }}/{{ gitlab_project_full_path }}
+          - >-
+            Repository:
+            {{ gitlab_project_repository_url }}
+          - >-
+            Default branch:
+            {{ gitlab_project_default_branch }}
+          - >-
+            Repository content:
+            {{
+              'committed and pushed'
+              if
+              (
+                gitlab_project_staged_changes is defined
+                and
+                gitlab_project_staged_changes.rc == 1
+              )
+              else
+              'already current'
+            }}
+          - >-
+            Authentication:
+            local GitLab Rails administration with a revoked temporary
+            project-scoped token
