@@ -24,7 +24,7 @@
 ###############################################################################
 
 - name: Create and seed sample-rhel9-web GitLab project
-  hosts: gitlab
+  hosts: gitlab*
   become: true
   gather_facts: true
   any_errors_fatal: true
