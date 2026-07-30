@@ -217,80 +217,80 @@
           {{ gitlab_project_source_directory }} is empty.
 
     ###########################################################################
-    # PHASE 0 | Validate GitLab installation
+    # PHASE 0 | Validate or initialize project source
     ###########################################################################
 
-    - name: PHASE 0 | Verify required commands
-      ansible.builtin.command:
-        argv:
-          - /bin/bash
-          - -c
-          - "command -v {{ item }}"
-      loop:
-        - git
-        - gitlab-rails
-        - gitlab-ctl
-        - rsync
-      changed_when: false
+    - name: PHASE 0 | Validate or initialize project source directory
+      block:
+        - name: PHASE 0 | Inspect project source directory
+          ansible.builtin.stat:
+            path: "{{ gitlab_project_source_directory }}"
+          register: gitlab_project_source_directory_status
 
-    - name: PHASE 0 | Check GitLab service status
-      ansible.builtin.command:
-        argv:
-          - gitlab-ctl
-          - status
-      register: gitlab_project_service_status
-      changed_when: false
+        - name: PHASE 0 | Require project source directory
+          ansible.builtin.assert:
+            that:
+              - gitlab_project_source_directory_status.stat.exists
+              - gitlab_project_source_directory_status.stat.isdir
+            fail_msg: >-
+              The project source directory
+              {{ gitlab_project_source_directory }} does not exist or is not a
+              directory on {{ inventory_hostname }}.
 
-    - name: PHASE 0 | Verify GitLab local administrator exists
-      ansible.builtin.command:
-        argv:
-          - gitlab-rails
-          - runner
-          - "-"
-      args:
-        stdin: |
-          actor =
-            User.find_by(username: "root") ||
-            User.where(admin: true).first
+      rescue:
+        - name: PHASE 0 | Create missing project source directory
+          ansible.builtin.file:
+            path: "{{ gitlab_project_source_directory }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0755"
 
-          raise(
-            "No local GitLab administrator account exists"
-          ) unless actor
+        - name: PHASE 0 | Create starter project README
+          ansible.builtin.copy:
+            dest: "{{ gitlab_project_source_directory }}/README.md"
+            owner: root
+            group: root
+            mode: "0644"
+            force: false
+            content: |
+              # sample-rhel9-web
 
-          puts(
-            "GITLAB_LOCAL_ADMIN=#{actor.username}"
-          )
-      register: gitlab_project_local_admin_check
-      changed_when: false
+              Sample RHEL 9 Image Mode web application project.
 
-    - name: PHASE 0 | Verify target GitLab group exists
-      ansible.builtin.command:
-        argv:
-          - gitlab-rails
-          - runner
-          - "-"
-      args:
-        stdin: |
-          group_path =
-            ENV.fetch("GITLAB_PROJECT_GROUP_PATH")
-               .to_s
-               .strip
+              This repository is managed automatically by Ansible.
 
-          group =
-            Group.find_by_full_path(group_path)
+        - name: PHASE 0 | Reinspect initialized project source directory
+          ansible.builtin.stat:
+            path: "{{ gitlab_project_source_directory }}"
+          register: gitlab_project_source_directory_status
 
-          raise(
-            "GitLab group #{group_path} does not exist"
-          ) unless group
+        - name: PHASE 0 | Verify initialized project source directory
+          ansible.builtin.assert:
+            that:
+              - gitlab_project_source_directory_status.stat.exists
+              - gitlab_project_source_directory_status.stat.isdir
+            fail_msg: >-
+              Ansible could not create the project source directory
+              {{ gitlab_project_source_directory }}.
 
-          puts(
-            "GITLAB_GROUP_ID=#{group.id}"
-          )
-      environment:
-        GITLAB_PROJECT_GROUP_PATH: "{{ gitlab_project_group_path }}"
-      register: gitlab_project_group_check
-      changed_when: false
+    - name: PHASE 0 | Find project source files
+      ansible.builtin.find:
+        paths: "{{ gitlab_project_source_directory }}"
+        file_type: any
+        hidden: true
+        recurse: true
+      register: gitlab_project_source_files
 
+    - name: PHASE 0 | Require project source content
+      ansible.builtin.assert:
+        that:
+          - gitlab_project_source_files.matched | int > 0
+        fail_msg: >-
+          The project source directory
+          {{ gitlab_project_source_directory }} exists but does not contain
+          any project files.
+          
   tasks:
     ###########################################################################
     # Main provisioning block
